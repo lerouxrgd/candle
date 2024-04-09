@@ -153,6 +153,18 @@ pub fn simple_eval(
         None => bail!("no graph defined in proto"),
         Some(graph) => graph,
     };
+    Ok(simple_graph_eval(graph, inputs)?.outputs)
+}
+
+struct GraphEvaluation {
+    inputs: HashMap<String, Value>,
+    outputs: HashMap<String, Value>,
+}
+
+fn simple_graph_eval(
+    graph: &onnx::GraphProto,
+    inputs: HashMap<String, Value>,
+) -> Result<GraphEvaluation> {
     let mut values = inputs;
     for t in graph.initializer.iter() {
         let tensor = get_tensor(t, t.name.as_str())?;
@@ -222,6 +234,7 @@ pub fn simple_eval(
             )
         }
     }
+
     // The nodes are topologically sorted so we can just process them in order.
     for node in graph.node.iter() {
         let get = |input_name: &str| match values.get(input_name) {
@@ -797,15 +810,44 @@ pub fn simple_eval(
                 let input = get(&node.input[0])?;
                 values.insert(node.output[0].clone(), input.clone());
             }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#if
+            "If" => {
+                let cond = get(&node.input[0])?.to_dtype(DType::U8)?.to_vec0::<u8>()?;
+                let Some(then_branch) = get_attr_(node, "then_branch")?.g.as_ref() else {
+                    bail!("missing 'then_branch' for op {node:?}");
+                };
+                let Some(else_branch) = get_attr_(node, "else_branch")?.g.as_ref() else {
+                    bail!("missing 'else_branch' for op {node:?}");
+                };
+                if cond == 1 {
+                    let GraphEvaluation { inputs, outputs } =
+                        simple_graph_eval(then_branch, values)?;
+                    values = inputs;
+                    values.extend(outputs);
+                } else {
+                    let GraphEvaluation { inputs, outputs } =
+                        simple_graph_eval(else_branch, values)?;
+                    values = inputs;
+                    values.extend(outputs);
+                }
+            }
+            // https://github.com/onnx/onnx/blob/main/docs/Operators.md#pad
+            "Pad" => {
+                unimplemented!()
+            }
             op_type => bail!("unsupported op_type {op_type} for op {node:?}"),
         }
     }
-    graph
+    let outputs = graph
         .output
         .iter()
         .map(|output| match values.remove(&output.name) {
             None => bail!("cannot find output {}", output.name),
             Some(value) => Ok((output.name.clone(), value)),
         })
-        .collect()
+        .collect::<Result<_>>()?;
+    Ok(GraphEvaluation {
+        inputs: values,
+        outputs,
+    })
 }
